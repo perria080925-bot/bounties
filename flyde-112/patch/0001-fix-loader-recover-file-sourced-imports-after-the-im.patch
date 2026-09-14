@@ -1,0 +1,259 @@
+From fb2d5e0cf414610d12240b1f3eec3180d160e334 Mon Sep 17 00:00:00 2001
+From: perria080925-bot <perria080925-bot@users.noreply.github.com>
+Date: Mon, 14 Sep 2026 01:33:57 +0000
+Subject: [PATCH] fix(loader): recover file-sourced imports after the imported
+ file is moved
+
+Fixes #112
+
+- When a flow references a node via a file source and the stored relative
+  path no longer resolves (imported file moved to another folder), the
+  loader now searches the project for a file with the same basename and
+  best path-suffix match instead of failing hard.
+- Direct hits keep the exact previous behavior (zero change for healthy
+  flows). Unresolvable cases still throw the original error.
+- No new dependencies; search skips node_modules/.git/dist and is
+  depth- and results-capped.
+- Adds recoverMovedFileSource.spec.ts (5 mocha cases, hermetic fixtures).
+---
+ .../server/findReferencedNodeServer.ts        |   8 +-
+ .../server/recoverMovedFileSource.spec.ts     |  84 ++++++++++++++
+ .../resolver/server/recoverMovedFileSource.ts | 109 ++++++++++++++++++
+ 3 files changed, 200 insertions(+), 1 deletion(-)
+ create mode 100644 loader/src/resolver/server/recoverMovedFileSource.spec.ts
+ create mode 100644 loader/src/resolver/server/recoverMovedFileSource.ts
+
+diff --git a/loader/src/resolver/server/findReferencedNodeServer.ts b/loader/src/resolver/server/findReferencedNodeServer.ts
+index ecfc88f..bf5963d 100644
+--- a/loader/src/resolver/server/findReferencedNodeServer.ts
++++ b/loader/src/resolver/server/findReferencedNodeServer.ts
+@@ -10,6 +10,7 @@ import * as _Nodes from "@flyde/nodes/dist/all";
+ import { join } from "path";
+ import { existsSync, readFileSync } from "fs";
+ import { resolveImportablePaths } from "./resolveImportablePaths";
++import { recoverMovedFileSource } from "./recoverMovedFileSource";
+ import { deserializeFlowByPath } from "../../serdes";
+ import { ReferencedNodeFinder } from "./../ReferencedNodeFinder";
+ import { resolveCodeNodeDependencies } from "./serverUtils";
+@@ -135,7 +136,12 @@ export function createServerReferencedNodeFinder(
+         return nodeWrapper;
+       }
+       case "file": {
+-        const fullFilePath = join(fullFlowPath, "..", instance.source.data);
++        const directPath = join(fullFlowPath, "..", instance.source.data);
++        // Issue #112: the stored relative path breaks when the imported file is
++        // moved to another folder. Recover by searching the project for the file.
++        const fullFilePath = existsSync(directPath)
++          ? directPath
++          : recoverMovedFileSource(fullFlowPath, instance.source.data) ?? directPath;
+ 
+         // Check if the file is a .flyde file (visual flow)
+         if (fullFilePath.endsWith('.flyde')) {
+diff --git a/loader/src/resolver/server/recoverMovedFileSource.spec.ts b/loader/src/resolver/server/recoverMovedFileSource.spec.ts
+new file mode 100644
+index 0000000..ac8397e
+--- /dev/null
++++ b/loader/src/resolver/server/recoverMovedFileSource.spec.ts
+@@ -0,0 +1,84 @@
++import { mkdirSync, writeFileSync, rmSync } from "fs";
++import { join } from "path";
++import { assert } from "chai";
++import { recoverMovedFileSource } from "./recoverMovedFileSource";
++
++/**
++ * Fixtures are built on the fly in a temp dir so the spec stays hermetic:
++ *   proj/
++ *     package.json
++ *     flows/main.flyde          (only a stub file: the flow content is irrelevant here)
++ *     parts/b.flyde             (original location — removed in the "moved" case)
++ *     newparts/b.flyde          (location after the user moved the file)
++ */
++describe("recoverMovedFileSource", () => {
++  const base = join(__dirname, "../../../fixture/recover-moved-file-source-tmp");
++
++  const B_FLOW = [
++    "node:",
++    "  id: AddOne",
++    "  inputs:",
++    "    n:",
++    "      mode: required",
++    "      type: number",
++    "  outputs:",
++    "    r:",
++    "      type: number",
++    "  instances: []",
++    "  connections: []",
++  ].join("\n");
++
++  beforeEach(() => {
++    rmSync(base, { recursive: true, force: true });
++    mkdirSync(join(base, "proj/flows"), { recursive: true });
++    mkdirSync(join(base, "proj/parts"), { recursive: true });
++    mkdirSync(join(base, "proj/newparts"), { recursive: true });
++    writeFileSync(join(base, "proj/package.json"), "{}");
++    writeFileSync(join(base, "proj/flows/main.flyde"), "node:\n  id: Main\n");
++    writeFileSync(join(base, "proj/parts/b.flyde"), B_FLOW);
++    writeFileSync(join(base, "proj/newparts/b.flyde"), B_FLOW);
++  });
++
++  afterEach(() => {
++    rmSync(base, { recursive: true, force: true });
++  });
++
++  const flowPath = () => join(base, "proj/flows/main.flyde");
++
++  it("returns the stored path untouched when it still resolves", () => {
++    const flowDir = join(base, "proj/flows");
++    const result = recoverMovedFileSource(flowPath(), "../parts/b.flyde");
++    assert.equal(result, join(flowDir, "../parts/b.flyde"));
++  });
++
++  it("recovers the file after it was moved to another folder", () => {
++    rmSync(join(base, "proj/parts"), { recursive: true, force: true });
++    const result = recoverMovedFileSource(flowPath(), "../parts/b.flyde");
++    assert.isNotNull(result);
++    assert.equal(result, join(base, "proj/newparts/b.flyde"));
++  });
++
++  it("still finds a candidate when several share the basename", () => {
++    rmSync(join(base, "proj/parts"), { recursive: true, force: true });
++    mkdirSync(join(base, "proj/parts/deep"), { recursive: true });
++    writeFileSync(join(base, "proj/parts/deep/b.flyde"), B_FLOW);
++    const result = recoverMovedFileSource(flowPath(), "../parts/b.flyde");
++    assert.isNotNull(result);
++    assert.match(String(result), /b\.flyde$/);
++  });
++
++  it("returns null when no plausible candidate exists", () => {
++    rmSync(join(base, "proj/parts"), { recursive: true, force: true });
++    rmSync(join(base, "proj/newparts"), { recursive: true, force: true });
++    const result = recoverMovedFileSource(flowPath(), "../parts/b.flyde");
++    assert.isNull(result);
++  });
++
++  it("never descends into node_modules or .git", () => {
++    rmSync(join(base, "proj/parts"), { recursive: true, force: true });
++    mkdirSync(join(base, "proj/node_modules/somepkg"), { recursive: true });
++    writeFileSync(join(base, "proj/node_modules/somepkg/b.flyde"), B_FLOW);
++    const result = recoverMovedFileSource(flowPath(), "../parts/b.flyde");
++    assert.isNull(result);
++  });
++});
+diff --git a/loader/src/resolver/server/recoverMovedFileSource.ts b/loader/src/resolver/server/recoverMovedFileSource.ts
+new file mode 100644
+index 0000000..f9ea266
+--- /dev/null
++++ b/loader/src/resolver/server/recoverMovedFileSource.ts
+@@ -0,0 +1,109 @@
++import { existsSync, readdirSync } from "fs";
++import { basename, dirname, resolve } from "path";
++
++/**
++ * Recovery logic for Flyde file-sourced imports whose stored relative path no
++ * longer resolves (e.g. after the imported file was moved to another folder).
++ *
++ * See flyde issue #112: "when I moved the imported file to a different folder,
++ * the import broke".
++ *
++ * Strategy:
++ *  1. Fast path: if the stored path resolves from the flow's directory, keep it.
++ *  2. Otherwise, locate the project root (nearest ancestor with package.json or
++ *     .git) and search it for files sharing the stored path's basename.
++ *  3. Among candidates, prefer the one whose path suffix best matches the
++ *     stored relative path (most segments in common, counted from the end).
++ */
++
++const SKIP_DIRS = new Set([
++  "node_modules",
++  ".git",
++  "dist",
++  "build",
++  "out",
++  ".flyde",
++  "coverage",
++]);
++
++const MAX_DEPTH = 8;
++const MAX_HITS = 50;
++
++function findProjectRoot(startDir: string): string {
++  let dir = resolve(startDir);
++  for (let i = 0; i < MAX_DEPTH; i++) {
++    if (existsSync(dir + "/package.json") || existsSync(dir + "/.git")) {
++      return dir;
++    }
++    const parent = dirname(dir);
++    if (parent === dir) break;
++    dir = parent;
++  }
++  return resolve(startDir);
++}
++
++function walk(dir: string, targetBase: string, hits: string[], depth: number): void {
++  if (hits.length >= MAX_HITS || depth > MAX_DEPTH) return;
++  let entries;
++  try {
++    entries = readdirSync(dir, { withFileTypes: true });
++  } catch {
++    return; // unreadable dir — ignore
++  }
++  for (const entry of entries) {
++    if (hits.length >= MAX_HITS) return;
++    if (entry.name.startsWith(".") || SKIP_DIRS.has(entry.name)) continue;
++    const full = dir + "/" + entry.name;
++    if (entry.isDirectory()) {
++      walk(full, targetBase, hits, depth + 1);
++    } else if (entry.isFile() && entry.name === targetBase) {
++      hits.push(full);
++    }
++  }
++}
++
++function suffixScore(candidatePath: string, storedParts: string[]): number {
++  const candidateParts = candidatePath.split("/");
++  let score = 0;
++  for (let i = 1; i <= storedParts.length; i++) {
++    const storedSeg = storedParts[storedParts.length - i];
++    const candSeg = candidateParts[candidateParts.length - i];
++    if (storedSeg === undefined || candSeg === undefined || storedSeg !== candSeg) {
++      break;
++    }
++    score += i;
++  }
++  return score;
++}
++
++/**
++ * Returns an absolute path for a file-sourced import. If the stored relative
++ * path resolves, it is returned untouched. If it is broken (file moved), the
++ * project tree is searched for a file with the same basename and the best
++ * suffix match is returned. Returns null when nothing plausible is found.
++ */
++export function recoverMovedFileSource(
++  fullFlowPath: string,
++  storedPath: string
++): string | null {
++  const direct = resolve(dirname(fullFlowPath), storedPath);
++  if (existsSync(direct)) return direct;
++
++  const normalizedStored = storedPath.replace(/\\/g, "/");
++  const root = findProjectRoot(dirname(fullFlowPath));
++  const hits: string[] = [];
++  walk(root, basename(normalizedStored), hits, 0);
++  if (hits.length === 0) return null;
++
++  const storedParts = normalizedStored.split("/").filter(Boolean);
++  let best: string | null = null;
++  let bestScore = -1;
++  for (const hit of hits) {
++    const score = suffixScore(hit, storedParts);
++    if (score > bestScore) {
++      bestScore = score;
++      best = hit;
++    }
++  }
++  return best;
++}
+-- 
+2.47.3
+
